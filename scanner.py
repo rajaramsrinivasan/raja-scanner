@@ -502,10 +502,40 @@ def send_email(subject, html_body):
 def save_results(results):
     os.makedirs("results", exist_ok=True)
     date_str = datetime.date.today().strftime("%Y-%m-%d")
-    path = f"results/scan_{date_str}.json"
+    path = "results/scan_" + date_str + ".json"
+
+    dashboard_data = {
+        "date":          date_str,
+        "ts":            datetime.datetime.utcnow().isoformat() + "Z",
+        "buy":           [r for r in results if r["action"] == "BUY"][:20],
+        "watch":         [r for r in results if r["action"] == "WATCH"][:10],
+        "total_scanned": len(results),
+    }
+
     with open(path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"💾 Results saved to {path}")
+    with open("results/latest.json", "w") as f:
+        json.dump(dashboard_data, f)
+    print("Saved to " + path)
+
+    # Push to GitHub Gist so Cloudflare dashboard can fetch it
+    gist_id    = os.environ.get("GIST_ID", "")
+    github_pat = os.environ.get("GITHUB_TOKEN", "")
+    if gist_id and github_pat:
+        try:
+            resp = requests.patch(
+                "https://api.github.com/gists/" + gist_id,
+                headers={"Authorization": "token " + github_pat,
+                         "Accept": "application/vnd.github.v3+json"},
+                json={"files": {"raja_scan_latest.json": {"content": json.dumps(dashboard_data)}}},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                print("Gist updated successfully")
+            else:
+                print("Gist update failed: " + str(resp.status_code))
+        except Exception as e:
+            print("Gist push failed: " + str(e))
     return path
 
 
