@@ -17,7 +17,6 @@ Usage:
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import requests
 import json
 import os
@@ -189,14 +188,23 @@ def analyse_symbol(sym, data):
         if avg_vol_20 < MIN_AVG_VOLUME:
             return None
 
-        # ── Indicators ─────────────────────────────────────────────────────
+        # ── Indicators (pure pandas — no external TA library needed) ───────
+
         # Rate of Change — % gain in last 20 trading days
         price_20d_ago = float(close.iloc[-21])
         roc_20 = ((cur_price - price_20d_ago) / price_20d_ago) * 100
 
-        # RSI (14-period)
-        rsi_series = ta.rsi(close, length=14)
-        rsi_val    = float(rsi_series.iloc[-1]) if rsi_series is not None else 50
+        # RSI (14-period) — Wilder smoothing
+        def calc_rsi(series, period=14):
+            delta = series.diff()
+            gain  = delta.clip(lower=0)
+            loss  = -delta.clip(upper=0)
+            avg_g = gain.ewm(alpha=1/period, min_periods=period).mean()
+            avg_l = loss.ewm(alpha=1/period, min_periods=period).mean()
+            rs    = avg_g / avg_l.replace(0, 1e-10)
+            return float((100 - 100 / (1 + rs)).iloc[-1])
+
+        rsi_val = calc_rsi(close)
 
         # Moving averages
         ma20 = float(close.tail(20).mean())
@@ -211,19 +219,19 @@ def analyse_symbol(sym, data):
         pct_from_52h = ((cur_price - w52_high) / w52_high) * 100
         pct_from_52l = ((cur_price - w52_low)  / w52_low)  * 100
 
-        # MACD signal
-        macd_data  = ta.macd(close)
-        macd_bull  = False
-        if macd_data is not None and len(macd_data) > 0:
-            macd_line  = macd_data.iloc[:, 0]  # MACD line
-            signal_line= macd_data.iloc[:, 2]  # Signal line
-            if not macd_line.empty and not signal_line.empty:
-                macd_bull = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
+        # MACD (12, 26, 9) — pure pandas
+        ema12      = close.ewm(span=12, adjust=False).mean()
+        ema26      = close.ewm(span=26, adjust=False).mean()
+        macd_line  = ema12 - ema26
+        signal_line= macd_line.ewm(span=9, adjust=False).mean()
+        macd_bull  = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
 
-        # ATR for volatility context
-        atr_series = ta.atr(high, low, close, length=14)
-        atr_val    = float(atr_series.iloc[-1]) if atr_series is not None else 0
-        atr_pct    = (atr_val / cur_price) * 100
+        # ATR (14-period)
+        tr     = pd.concat([high - low,
+                             (high - close.shift()).abs(),
+                             (low  - close.shift()).abs()], axis=1).max(axis=1)
+        atr_val = float(tr.tail(14).mean())
+        atr_pct = (atr_val / cur_price) * 100
 
         # ── Scoring ─────────────────────────────────────────────────────────
         # 8 possible signals — need 3+ for BUY, 2 for WATCH
