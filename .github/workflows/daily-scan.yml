@@ -1,1 +1,49 @@
+name: Raja Daily Market Scanner
 
+on:
+  schedule:
+    - cron: "45 3 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Test mode - 30 stocks only?"
+        required: false
+        default: "false"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install yfinance pandas pandas_ta requests
+
+      - name: Run scanner
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
+            python scanner.py --test
+          else
+            python scanner.py
+          fi
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30
