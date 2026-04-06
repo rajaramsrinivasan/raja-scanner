@@ -35,6 +35,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GIST_ID:           ${{ secrets.GIST_ID }}
           GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GH_USERNAME:       ${{ secrets.GH_USERNAME }}
         run: |
           if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
             python scanner.py --test
