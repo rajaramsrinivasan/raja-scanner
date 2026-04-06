@@ -531,7 +531,8 @@ def save_results(results):
                 timeout=15,
             )
             if resp.status_code == 200:
-                print("Gist updated successfully")
+                raw = "https://gist.githubusercontent.com/" + os.environ.get("GH_USERNAME","rajaramsrinivasan") + "/" + gist_id + "/raw/raja_scan_latest.json"
+                print("Gist updated: " + raw)
             else:
                 print("Gist update failed: " + str(resp.status_code))
         except Exception as e:
