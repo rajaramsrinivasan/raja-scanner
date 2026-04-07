@@ -47,43 +47,10 @@ SCORE_THRESHOLD = 3      # minimum score to appear in BUY signals
 
 
 # ── Step 1: Build full NSE + BSE universe ─────────────────────────────────────
-def _map_industry_to_sector(industry: str) -> str:
-    """Map NSE Industry string to a short dashboard sector label."""
-    if not industry:
-        return "Other"
-    ind = industry.upper()
-    if any(x in ind for x in ["BANK", "FINANCE", "FINANCIAL"]):
-        return "Banking"
-    if any(x in ind for x in ["AUTO", "VEHICLE", "TYRE", "AUTOMOBILE"]):
-        return "Auto"
-    if any(x in ind for x in ["PHARMA", "DRUG", "BIOTECH", "HEALTHCARE", "HOSPITAL", "MEDICAL"]):
-        return "Healthcare"
-    if any(x in ind for x in ["SOFTWARE", "IT ", "TECHNOLOGY", "COMPUTER", "TELECOM", "INTERNET"]):
-        return "IT"
-    if any(x in ind for x in ["FMCG", "CONSUMER", "FOOD", "BEVERAGE", "TOBACCO", "PERSONAL CARE"]):
-        return "FMCG"
-    if any(x in ind for x in ["POWER", "ENERGY", "ELECTRIC", "SOLAR", "WIND", "RENEWABLE"]):
-        return "Energy"
-    if any(x in ind for x in ["CEMENT", "CONSTRUCTION", "INFRASTRUCTURE", "REAL ESTATE", "HOUSING"]):
-        return "Infra"
-    if any(x in ind for x in ["METAL", "STEEL", "MINING", "ALUMINIUM", "COPPER", "ZINC"]):
-        return "Metals"
-    if any(x in ind for x in ["CHEMICAL", "FERTILIZER", "PETROCHEMICAL", "PAINT", "PLASTIC"]):
-        return "Chemicals"
-    if any(x in ind for x in ["NBFC", "INSURANCE", "MICROFINANCE"]):
-        return "NBFC"
-    if any(x in ind for x in ["RETAIL", "TEXTILE", "APPAREL", "GARMENT"]):
-        return "Retail"
-    if any(x in ind for x in ["OIL", "GAS", "PETROLEUM", "REFIN"]):
-        return "Oil & Gas"
-    return "Other"
-
-
 def get_nse_symbols():
-    """Fetch all NSE-listed stocks from multiple indices. Returns (symbols, sector_map)."""
+    """Fetch all NSE-listed stocks from multiple indices."""
     print("📥 Fetching NSE universe...")
     all_symbols = set()
-    sector_map  = {}   # symbol -> short sector label
 
     # NSE indices to pull from
     index_urls = {
@@ -101,6 +68,7 @@ def get_nse_symbols():
     }
 
     session = requests.Session()
+    # Prime NSE session cookie
     try:
         session.get("https://www.nseindia.com", headers=headers, timeout=10)
     except Exception:
@@ -111,15 +79,12 @@ def get_nse_symbols():
             resp = session.get(url, headers=headers, timeout=15)
             if resp.status_code == 200:
                 df = pd.read_csv(StringIO(resp.text))
+                # Column is usually 'Symbol'
                 sym_col = next((c for c in df.columns if 'symbol' in c.lower()), None)
-                ind_col = next((c for c in df.columns if 'industry' in c.lower()), None)
                 if sym_col:
-                    for _, row in df.iterrows():
-                        sym = str(row[sym_col]).strip()
-                        all_symbols.add(sym)
-                        if ind_col and sym not in sector_map:
-                            sector_map[sym] = _map_industry_to_sector(str(row[ind_col]))
-                    print(f"  ✅ {name}: {len(df)} stocks")
+                    syms = df[sym_col].str.strip().tolist()
+                    all_symbols.update(syms)
+                    print(f"  ✅ {name}: {len(syms)} stocks")
                 else:
                     print(f"  ⚠️  {name}: could not find Symbol column")
             else:
@@ -127,13 +92,14 @@ def get_nse_symbols():
         except Exception as e:
             print(f"  ❌ {name}: {e}")
 
+    # Fallback hardcoded list if NSE is blocking
     if len(all_symbols) < 100:
         print("  Using fallback hardcoded Nifty 500 list...")
         all_symbols.update(FALLBACK_SYMBOLS)
 
     symbols_ns = [s + ".NS" for s in sorted(all_symbols)]
     print(f"✅ Total NSE universe: {len(symbols_ns)} stocks\n")
-    return symbols_ns, sector_map
+    return symbols_ns
 
 
 def get_bse_symbols():
@@ -347,13 +313,12 @@ def analyse_symbol(sym, data):
         return None
 
 
-def run_full_scan(symbols, sector_map=None):
+def run_full_scan(symbols):
     """Scan all symbols in batches and collect results."""
-    results    = []
-    failed     = []
-    total      = len(symbols)
-    batches    = [symbols[i:i+BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-    sector_map = sector_map or {}
+    results   = []
+    failed    = []
+    total     = len(symbols)
+    batches   = [symbols[i:i+BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
 
     print(f"🔍 Scanning {total} stocks in {len(batches)} batches of {BATCH_SIZE}...\n")
     t0 = time.time()
@@ -371,8 +336,6 @@ def run_full_scan(symbols, sector_map=None):
         for sym in batch:
             result = analyse_symbol(sym, data)
             if result:
-                base = sym.replace(".NS", "").replace(".BO", "")
-                result["sector"] = sector_map.get(base, "Other")
                 results.append(result)
 
         time.sleep(SLEEP_BETWEEN)  # be polite to Yahoo
@@ -538,8 +501,10 @@ def send_email(subject, html_body):
 # ── Step 6: Save results to JSON ──────────────────────────────────────────────
 def save_results(results):
     os.makedirs("results", exist_ok=True)
-    date_str = datetime.date.today().strftime("%Y-%m-%d")
-    path = "results/scan_" + date_str + ".json"
+    now_ist  = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+    date_str = now_ist.strftime("%d %b %Y, %I:%M %p IST")
+    file_date = now_ist.strftime("%Y-%m-%d")
+    path = "results/scan_" + file_date + ".json"
 
     dashboard_data = {
         "date":          date_str,
@@ -641,9 +606,8 @@ def main():
     if TEST_MODE:
         print("🧪 TEST MODE — using 30 stocks only\n")
         symbols = [s + ".NS" for s in FALLBACK_SYMBOLS[:30]]
-        sector_map = {}
     else:
-        nse_syms, sector_map = get_nse_symbols()
+        nse_syms = get_nse_symbols()
         bse_syms = get_bse_symbols()
         # Combine NSE + BSE, deduplicate by base symbol
         symbols = nse_syms + [s for s in bse_syms if s.replace(".BO", "") not in
@@ -651,7 +615,7 @@ def main():
         print(f"📋 Total universe: {len(symbols)} stocks (NSE + BSE combined)\n")
 
     # Run scan
-    results = run_full_scan(symbols, sector_map)
+    results = run_full_scan(symbols)
 
     # Save results
     save_results(results)
