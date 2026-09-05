@@ -34,7 +34,7 @@ jobs:
           EMAIL_TO:          ${{ secrets.EMAIL_TO }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GIST_ID:           ${{ secrets.GIST_ID }}
-          GIST_TOKEN:        ${{ secrets.GIST_TOKEN }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
           GH_USERNAME:       ${{ secrets.GH_USERNAME }}
         run: |
           if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
