@@ -519,37 +519,120 @@ def save_results(results):
     print("Saved to " + path)
 
     # Push to GitHub Gist so Cloudflare dashboard can fetch it
-    # NOTE: must be GIST_TOKEN, not GITHUB_TOKEN. GitHub rejects user-defined
-    # secrets starting with GITHUB_, and its built-in token has no gist scope.
-    gist_id    = os.environ.get("GIST_ID", "")
-    gist_token = os.environ.get("GIST_TOKEN", "")
+    # ── Publish to GitHub Gist (with self-diagnosis) ──────────────────────
+    gist_id = os.environ.get("GIST_ID", "")
+    token   = os.environ.get("GIST_TOKEN", "")
 
-    if not gist_id or not gist_token:
-        print("ERROR: GIST_ID or GIST_TOKEN not set - dashboard will not update")
+    print("")
+    print("=" * 62)
+    print("PUBLISHING TO GIST")
+    print("=" * 62)
+
+    if not gist_id or not token:
+        print("FAILED: required secrets are missing.")
+        print("  GIST_ID    : " + ("set" if gist_id else "MISSING"))
+        print("  GIST_TOKEN : " + ("set" if token else "MISSING"))
+        print("")
+        print("FIX: repo -> Settings -> Secrets and variables -> Actions")
+        print("     -> New repository secret. Add whichever is missing.")
+        print("     The token secret must be named GIST_TOKEN exactly;")
+        print("     GitHub rejects user secrets beginning with GITHUB_.")
         sys.exit(1)
 
+    H = {"Authorization": "Bearer " + token,
+         "Accept": "application/vnd.github+json",
+         "User-Agent": "raja-scanner"}
+
+    # Step 1 — is the token itself valid?
     try:
-        resp = requests.patch(
-            "https://api.github.com/gists/" + gist_id,
-            headers={"Authorization": "Bearer " + gist_token,
-                     "Accept": "application/vnd.github+json",
-                     "User-Agent": "raja-scanner"},
-            json={"files": {"raja_scan_latest.json": {"content": json.dumps(dashboard_data)}}},
-            timeout=25,
-        )
-        if resp.status_code == 200:
-            print("Gist updated OK - buy=%d watch=%d scanned=%d" % (
-                len(dashboard_data["buy"]), len(dashboard_data["watch"]),
-                dashboard_data["total_scanned"]))
-        else:
-            # Fail loudly so the workflow goes red instead of silently green
-            print("ERROR: Gist update failed %s: %s" % (resp.status_code, resp.text[:300]))
-            sys.exit(1)
-    except SystemExit:
-        raise
+        who = requests.get("https://api.github.com/user", headers=H, timeout=20)
     except Exception as e:
-        print("ERROR: Gist push failed: " + str(e))
+        print("FAILED: could not reach api.github.com: " + str(e))
         sys.exit(1)
+
+    if who.status_code == 401:
+        print("FAILED: the token is invalid, revoked, or expired (401).")
+        print("")
+        print("FIX: github.com/settings/tokens -> generate a new token,")
+        print("     then update the GIST_TOKEN repo secret with the new value.")
+        sys.exit(1)
+    if who.status_code != 200:
+        print("FAILED: unexpected %s from /user: %s" % (who.status_code, who.text[:200]))
+        sys.exit(1)
+
+    login  = who.json().get("login", "?")
+    scopes = who.headers.get("X-OAuth-Scopes")
+    print("Token OK - authenticated as: " + login)
+    if scopes is not None:
+        print("Token scopes: " + (scopes if scopes else "(none)"))
+        if scopes and "gist" not in scopes:
+            print("")
+            print("WARNING: this classic token has no 'gist' scope.")
+            print("FIX: github.com/settings/tokens -> edit token -> tick 'gist'.")
+
+    # Step 2 — can this token see the gist?
+    g = requests.get("https://api.github.com/gists/" + gist_id, headers=H, timeout=20)
+
+    if g.status_code == 404:
+        # Distinguish "gist doesn't exist" from "token can't see it"
+        anon = requests.get("https://api.github.com/gists/" + gist_id,
+                            headers={"User-Agent": "raja-scanner"}, timeout=20)
+        print("")
+        if anon.status_code == 200:
+            owner = anon.json().get("owner", {}).get("login", "?")
+            print("FAILED: the gist exists but your token cannot access it.")
+            print("  Gist owner   : " + owner)
+            print("  Token user   : " + login)
+            if owner != login:
+                print("")
+                print("  The token belongs to a DIFFERENT account than the gist.")
+                print("  FIX: create the token from the " + owner + " account.")
+            else:
+                print("")
+                print("  FIX: github.com/settings/tokens -> your token ->")
+                print("       ACCOUNT permissions (not Repository permissions)")
+                print("       -> Gists -> Read and write. Then save and re-run.")
+                print("       Account permissions is the section people miss,")
+                print("       because gists do not belong to a repository.")
+        else:
+            print("FAILED: no gist found with ID " + gist_id)
+            print("")
+            print("FIX: open gist.github.com, find the gist, and copy the ID")
+            print("     from the URL. Update the GIST_ID secret in BOTH")
+            print("     GitHub Actions and Cloudflare.")
+        sys.exit(1)
+
+    if g.status_code != 200:
+        print("FAILED: %s reading the gist: %s" % (g.status_code, g.text[:200]))
+        sys.exit(1)
+
+    print("Gist found - owner: " + g.json().get("owner", {}).get("login", "?"))
+
+    # Step 3 — write it
+    r = requests.patch(
+        "https://api.github.com/gists/" + gist_id,
+        headers=H,
+        json={"files": {"raja_scan_latest.json":
+                        {"content": json.dumps(dashboard_data)}}},
+        timeout=30,
+    )
+
+    if r.status_code != 200:
+        print("")
+        print("FAILED: %s writing the gist: %s" % (r.status_code, r.text[:300]))
+        if r.status_code == 403:
+            print("")
+            print("FIX: the token can READ gists but not WRITE them.")
+            print("     Change the Gists permission to 'Read and write'.")
+        sys.exit(1)
+
+    print("")
+    print("SUCCESS - gist updated")
+    print("  buy     : %d" % len(dashboard_data["buy"]))
+    print("  watch   : %d" % len(dashboard_data["watch"]))
+    print("  scanned : %d" % dashboard_data["total_scanned"])
+    print("  live at : https://rajaportfolio.com")
+    print("=" * 62)
 
     return path
 
