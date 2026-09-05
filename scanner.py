@@ -1,400 +1,665 @@
 """
-Raja Swing Scanner
-==================
-Finds NSE stocks positioned to move +8% quickly — catching entries at the
-start of a move rather than after it.
+Raja's NSE+BSE Full Market Scanner
+====================================
+Scans ALL listed NSE stocks (~1,800) for momentum setups.
+Runs daily at 9:15 AM IST via GitHub Actions.
+Sends actionable email with top BUY signals before market open.
 
-Replaces the old summed-score approach, which counted one event (a recent
-spike) four times over and so fired on almost everything. This version uses
-four independent gates that must EACH pass, plus a hard extension filter.
-
-Every threshold lives in the TUNING block below. When the backtest finishes,
-change the numbers there and nothing else.
+Setup:
+  pip install yfinance pandas pandas_ta requests
+  Set env vars: RESEND_API_KEY, EMAIL_TO, ANTHROPIC_API_KEY (optional)
 
 Usage:
-  pip install yfinance pandas numpy requests
-  python scanner.py           # full scan
-  python scanner.py --test    # 40 stocks
+  python scanner.py               # full scan
+  python scanner.py --test        # test with 20 stocks only
+  python scanner.py --email-only  # re-send last results
 """
 
-import datetime
+import yfinance as yf
+import pandas as pd
+import requests
 import json
 import os
 import sys
 import time
-import warnings
+import datetime
 from io import StringIO
 
-import numpy as np
-import pandas as pd
-import requests
-import yfinance as yf
+# ── Config ────────────────────────────────────────────────────────────────────
+RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
+EMAIL_FROM      = os.environ.get("EMAIL_FROM", "briefing@rajaportfolio.com")
+EMAIL_TO        = os.environ.get("EMAIL_TO", "pss.rajaram@gmail.com")
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 
-warnings.filterwarnings("ignore")
+TEST_MODE       = "--test" in sys.argv
+BATCH_SIZE      = 50     # fetch 50 stocks at once (safe for Yahoo rate limits)
+SLEEP_BETWEEN   = 2      # seconds between batches
+MIN_PRICE       = 50     # ignore penny stocks below ₹50
+MAX_PRICE       = 50000  # ignore outliers above ₹50,000
+MIN_AVG_VOLUME  = 50000  # ignore illiquid stocks (avg daily volume < 50K shares)
 
-# ── Secrets ───────────────────────────────────────────────────────────────────
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-EMAIL_FROM     = os.environ.get("EMAIL_FROM", "briefing@rajaportfolio.com")
-EMAIL_TO       = os.environ.get("EMAIL_TO", "pss.rajaram@gmail.com")
-GIST_ID        = os.environ.get("GIST_ID", "")
-GIST_TOKEN     = os.environ.get("GIST_TOKEN", "")
-
-TEST_MODE  = "--test" in sys.argv
-BATCH_SIZE = 50
-GIST_FILE  = "raja_scan_latest.json"
-
-# ══ TUNING ════════════════════════════════════════════════════════════════════
-# Universe filters
-MIN_PRICE      = 50
-MAX_PRICE      = 50000
-MIN_AVG_VOLUME = 100000      # shares/day — below this you can't exit cleanly
-
-# Gate 1 — Trend: is this stock in an uptrend worth joining?
-MIN_RS60          = 2.0      # % outperformance vs Nifty over 60 days
-MA50_SLOPE_DAYS   = 10       # MA50 must be higher than it was N days ago
-
-# Gate 2 — Setup: is it coiled or resting, rather than extended?
-BBW_RANK_MAX      = 0.35     # Bollinger bandwidth in bottom 35% of 6-month range
-PULLBACK_EXT_MAX  = 3.0      # ...or price was within 3% of MA20 yesterday
-
-# Gate 3 — Trigger: did the move start in the last day or two?
-VOL_RATIO_MIN     = 1.5      # vs the PRIOR 20-day average, not including today
-BREAKOUT_LOOKBACK = 20       # close must exceed this many days of prior highs
-
-# Gate 4 — Risk: is the stop tight enough for +8% to be worth taking?
-ATR_PCT_MIN       = 1.2      # too quiet = won't reach target in time
-ATR_PCT_MAX       = 5.5      # too wild = stop gets hit on noise
-MAX_EXT_MA20      = 6.0      # THE KEY FILTER — reject anything already extended
-MAX_ROC5          = 12.0     # hasn't already run this week
-
-# Trade parameters written into every recommendation
-TARGET_PCT = 8.0
-STOP_PCT   = 4.0
-MAX_HOLD_D = 20
-# ══════════════════════════════════════════════════════════════════════════════
-
-FALLBACK = [
-    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","SBIN","ITC","LT","AXISBANK",
-    "BHARTIARTL","TATAMOTORS","TATASTEEL","SUNPHARMA","MARUTI","TITAN","BAJFINANCE",
-    "HCLTECH","WIPRO","ULTRACEMCO","ASIANPAINT","NTPC","POWERGRID","ONGC","COALINDIA",
-    "JSWSTEEL","HINDALCO","CIPLA","DRREDDY","TECHM","GRASIM","TRENT","DLF","HAL","BEL",
-    "IRCTC","PERSISTENT","POLYCAB","CUMMINSIND","DIXON","KPITTECH","TATAELXSI",
-    "APLAPOLLO","SUPREMEIND","ASTRAL","NAVINFLUOR","DEEPAKNTR","COFORGE","MPHASIS",
-    "LTIM","OBEROIRLTY","INDIGO","VBL","ZOMATO","JUBLFOOD","PIIND","SRF","BALKRISIND",
-    "ESCORTS","MFSL","MUTHOOTFIN","CANBK","BANKBARODA","PNB","IDFCFIRSTB","FEDERALBNK",
-]
+# Signal thresholds
+ROC_20_MIN      = 8      # min % gain in last 20 trading days to flag
+VOL_SPIKE_MIN   = 2.0    # volume must be 2x+ 20-day average
+RSI_MIN         = 45     # RSI lower bound (not oversold)
+RSI_MAX         = 72     # RSI upper bound (not overbought)
+SCORE_THRESHOLD = 3      # minimum score to appear in BUY signals
 
 
-# ── Indicators ────────────────────────────────────────────────────────────────
-def rsi(s, n=14):
-    d = s.diff()
-    g = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+# ── Step 1: Build full NSE + BSE universe ─────────────────────────────────────
+def get_nse_symbols():
+    """Fetch all NSE-listed stocks from multiple indices."""
+    print("📥 Fetching NSE universe...")
+    all_symbols = set()
 
-
-def atr(h, l, c, n=14):
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
-
-
-# ── Universe ──────────────────────────────────────────────────────────────────
-def get_universe():
-    if TEST_MODE:
-        print(f"Test mode — {len(FALLBACK[:40])} symbols")
-        return FALLBACK[:40]
-
-    syms = set()
-    sources = {
-        "Nifty 500":  "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
-        "Midcap 150": "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
-        "Smallcap":   "https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    # NSE indices to pull from
+    index_urls = {
+        "Nifty 500":    "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+        "Nifty Midcap": "https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+        "Nifty Smallcap":"https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+        "Nifty Microcap":"https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv",
     }
-    hdr = {"User-Agent": "Mozilla/5.0"}
-    for name, url in sources.items():
-        try:
-            r = requests.get(url, headers=hdr, timeout=20)
-            df = pd.read_csv(StringIO(r.text))
-            got = df["Symbol"].dropna().astype(str).str.strip().tolist()
-            syms.update(got)
-            print(f"  {name}: {len(got)}")
-        except Exception as e:
-            print(f"  {name} failed: {e}")
 
-    if not syms:
-        print(f"All NSE lists failed — using {len(FALLBACK)} fallback symbols")
-        return FALLBACK
-    out = sorted(syms)
-    print(f"Universe: {len(out)} symbols")
-    return out
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.nseindia.com/",
+    }
 
-
-def get_benchmark():
+    session = requests.Session()
+    # Prime NSE session cookie
     try:
-        d = yf.download("^NSEI", period="1y", interval="1d",
-                        auto_adjust=True, progress=False)
-        c = d["Close"].squeeze()
-        return float((c.iloc[-1] / c.iloc[-61] - 1) * 100)
-    except Exception as e:
-        print(f"Benchmark failed ({e}) — relative strength gate disabled")
-        return None
-
-
-def get_vix():
-    try:
-        d = yf.download("^INDIAVIX", period="5d", interval="1d",
-                        auto_adjust=True, progress=False)
-        return round(float(d["Close"].squeeze().iloc[-1]), 1)
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
     except Exception:
-        return None
+        pass
 
-
-# ── Analysis ──────────────────────────────────────────────────────────────────
-def analyse(sym, df, bench_roc60):
-    if df is None or len(df) < 210:
-        return None
-
-    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-    price = float(c.iloc[-1])
-    if not (MIN_PRICE <= price <= MAX_PRICE):
-        return None
-
-    avgvol = float(v.rolling(20).mean().shift(1).iloc[-1])
-    if not np.isfinite(avgvol) or avgvol < MIN_AVG_VOLUME:
-        return None
-
-    ma20  = float(c.rolling(20).mean().iloc[-1])
-    ma50  = c.rolling(50).mean()
-    ma200 = float(c.rolling(200).mean().iloc[-1])
-    rsi_v = float(rsi(c).iloc[-1])
-
-    roc5  = float((c.iloc[-1] / c.iloc[-6] - 1) * 100)
-    roc20 = float((c.iloc[-1] / c.iloc[-21] - 1) * 100)
-    roc60 = float((c.iloc[-1] / c.iloc[-61] - 1) * 100)
-
-    volratio = float(v.iloc[-1] / avgvol)
-    atr_v    = float(atr(h, l, c).iloc[-1])
-    atr_pct  = atr_v / price * 100
-
-    hi20 = float(h.rolling(BREAKOUT_LOOKBACK).max().shift(1).iloc[-1])
-    ext  = (price - ma20) / ma20 * 100
-    ext_prev = float(((c.iloc[-2] - c.rolling(20).mean().iloc[-2])
-                      / c.rolling(20).mean().iloc[-2]) * 100)
-
-    sd  = c.rolling(20).std()
-    bbw = (2 * sd) / c.rolling(20).mean() * 100
-    bbw_rank = float(bbw.rolling(120).rank(pct=True).iloc[-2])
-
-    e12, e26 = c.ewm(span=12, adjust=False).mean(), c.ewm(span=26, adjust=False).mean()
-    macd, sigl = e12 - e26, (e12 - e26).ewm(span=9, adjust=False).mean()
-    macd_cross = bool(macd.iloc[-1] > sigl.iloc[-1] and macd.iloc[-2] <= sigl.iloc[-2])
-
-    rs60 = roc60 - bench_roc60 if bench_roc60 is not None else 999
-    ma50_rising = bool(float(ma50.iloc[-1]) > float(ma50.iloc[-1 - MA50_SLOPE_DAYS]))
-
-    # ── The four gates ────────────────────────────────────────────────────────
-    trend   = price > ma200 and ma50_rising and rs60 > MIN_RS60
-    setup   = bbw_rank < BBW_RANK_MAX or ext_prev < PULLBACK_EXT_MAX
-    trigger = (price > hi20 or macd_cross) and volratio >= VOL_RATIO_MIN
-    risk    = (ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX
-               and ext < MAX_EXT_MA20 and roc5 < MAX_ROC5)
-
-    if not (trend and setup and trigger and risk):
-        return None
-
-    # Describe what actually fired, in plain terms
-    reasons = []
-    if price > hi20:
-        reasons.append(f"Broke above its {BREAKOUT_LOOKBACK}-day high today")
-    if macd_cross:
-        reasons.append("Momentum turned up (MACD crossover)")
-    if bbw_rank < 0.20:
-        reasons.append("Was tightly coiled before this move")
-    elif bbw_rank < BBW_RANK_MAX:
-        reasons.append("Volatility had compressed")
-    if ext_prev < 0:
-        reasons.append("Entering off a pullback, not a spike")
-    reasons.append(f"Volume {volratio:.1f}x its 20-day average")
-    reasons.append(f"Outperforming Nifty by {rs60:.0f}% over 60 days")
-
-    setup_type = ("Squeeze breakout" if bbw_rank < 0.20 and price > hi20 else
-                  "Base breakout"    if price > hi20 else
-                  "Pullback reversal")
-
-    stop   = round(min(price * (1 - STOP_PCT / 100), price - 1.5 * atr_v), 2)
-    target = round(price * (1 + TARGET_PCT / 100), 2)
-    rr     = (target - price) / max(price - stop, 0.01)
-
-    if rr < 1.5:
-        return None   # not enough reward for the risk being taken
-
-    return {
-        "symbol":     sym,
-        "exchange":   "NSE",
-        "price":      round(price, 2),
-        "setup":      setup_type,
-        "entry_below": round(price * 1.01, 2),
-        "stop":       stop,
-        "target":     target,
-        "rr":         round(rr, 2),
-        "risk_pct":   round((price - stop) / price * 100, 2),
-        "rsi":        round(rsi_v),
-        "vol_ratio":  round(volratio, 1),
-        "roc_20":     round(roc20, 1),
-        "roc_5":      round(roc5, 1),
-        "ext_ma20":   round(ext, 1),
-        "atr_pct":    round(atr_pct, 1),
-        "rs60":       round(rs60, 1),
-        "est_days":   int(max(3, min(MAX_HOLD_D, round(TARGET_PCT / max(atr_pct, 0.5))))),
-        "reasons":    reasons,
-    }
-
-
-# ── Scan ──────────────────────────────────────────────────────────────────────
-def run_scan(symbols, bench):
-    results, scanned = [], 0
-    tickers = [s + ".NS" for s in symbols]
-
-    for k in range(0, len(tickers), BATCH_SIZE):
-        batch = tickers[k:k + BATCH_SIZE]
-        print(f"  {k + 1}-{k + len(batch)} of {len(tickers)}")
+    for name, url in index_urls.items():
         try:
-            data = yf.download(batch, period="1y", interval="1d", group_by="ticker",
-                               auto_adjust=True, progress=False, threads=True)
+            resp = session.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                df = pd.read_csv(StringIO(resp.text))
+                # Column is usually 'Symbol'
+                sym_col = next((c for c in df.columns if 'symbol' in c.lower()), None)
+                if sym_col:
+                    syms = df[sym_col].str.strip().tolist()
+                    all_symbols.update(syms)
+                    print(f"  ✅ {name}: {len(syms)} stocks")
+                else:
+                    print(f"  ⚠️  {name}: could not find Symbol column")
+            else:
+                print(f"  ❌ {name}: HTTP {resp.status_code}")
         except Exception as e:
-            print(f"    batch failed: {e}")
+            print(f"  ❌ {name}: {e}")
+
+    # Fallback hardcoded list if NSE is blocking
+    if len(all_symbols) < 100:
+        print("  Using fallback hardcoded Nifty 500 list...")
+        all_symbols.update(FALLBACK_SYMBOLS)
+
+    symbols_ns = [s + ".NS" for s in sorted(all_symbols)]
+    print(f"✅ Total NSE universe: {len(symbols_ns)} stocks\n")
+    return symbols_ns
+
+
+def get_bse_symbols():
+    """
+    BSE has 5000+ stocks. We use a curated BSE 500 list.
+    Full BSE scrape via bhavcopy for production use.
+    """
+    print("📥 Fetching BSE symbols via bhavcopy...")
+    try:
+        # BSE bhavcopy — daily equity file
+        today = datetime.date.today()
+        # Try last 5 days in case of holiday
+        for days_back in range(1, 6):
+            dt = today - datetime.timedelta(days=days_back)
+            url = f"https://www.bseindia.com/download/BhavCopy/Equity/EQ{dt.strftime('%d%m%y')}_CSV.ZIP"
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                import zipfile, io
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                    csv_name = z.namelist()[0]
+                    with z.open(csv_name) as f:
+                        df = pd.read_csv(f)
+                        # BSE bhavcopy has SC_CODE and SC_NAME
+                        if 'SC_CODE' in df.columns:
+                            codes = df['SC_CODE'].astype(str).tolist()
+                            syms = [c + ".BO" for c in codes]
+                            print(f"✅ BSE bhavcopy: {len(syms)} stocks\n")
+                            return syms[:2000]  # Top 2000 by liquidity
+                break
+    except Exception as e:
+        print(f"  BSE fetch failed: {e} — skipping BSE\n")
+
+    return []
+
+
+# ── Step 2: Scan in batches ───────────────────────────────────────────────────
+def scan_batch(symbols, period="2mo"):
+    """Download OHLCV for a batch and return cleaned DataFrame."""
+    try:
+        data = yf.download(
+            symbols,
+            period=period,
+            interval="1d",
+            progress=False,
+            threads=True,
+            group_by="ticker",
+        )
+        return data
+    except Exception as e:
+        print(f"    Batch download error: {e}")
+        return None
+
+
+def analyse_symbol(sym, data):
+    """
+    Run all signals on one symbol's OHLCV data.
+    Returns a dict of signal results or None if data insufficient.
+    """
+    try:
+        # Extract OHLCV
+        if isinstance(data.columns, pd.MultiIndex):
+            if sym not in data.columns.get_level_values(0):
+                return None
+            df = data[sym].copy()
+        else:
+            df = data.copy()
+
+        df = df.dropna(subset=["Close"])
+        if len(df) < 22:
+            return None
+
+        close  = df["Close"]
+        volume = df["Volume"]
+        high   = df["High"]
+        low    = df["Low"]
+
+        cur_price  = float(close.iloc[-1])
+        cur_volume = float(volume.iloc[-1])
+
+        # Price filter
+        if cur_price < MIN_PRICE or cur_price > MAX_PRICE:
+            return None
+
+        # Liquidity filter
+        avg_vol_20 = float(volume.tail(20).mean())
+        if avg_vol_20 < MIN_AVG_VOLUME:
+            return None
+
+        # ── Indicators (pure pandas — no external TA library needed) ───────
+
+        # Rate of Change — % gain in last 20 trading days
+        price_20d_ago = float(close.iloc[-21])
+        roc_20 = ((cur_price - price_20d_ago) / price_20d_ago) * 100
+
+        # RSI (14-period) — Wilder smoothing
+        def calc_rsi(series, period=14):
+            delta = series.diff()
+            gain  = delta.clip(lower=0)
+            loss  = -delta.clip(upper=0)
+            avg_g = gain.ewm(alpha=1/period, min_periods=period).mean()
+            avg_l = loss.ewm(alpha=1/period, min_periods=period).mean()
+            rs    = avg_g / avg_l.replace(0, 1e-10)
+            return float((100 - 100 / (1 + rs)).iloc[-1])
+
+        rsi_val = calc_rsi(close)
+
+        # Moving averages
+        ma20 = float(close.tail(20).mean())
+        ma50 = float(close.tail(50).mean()) if len(close) >= 50 else ma20
+
+        # Volume spike
+        vol_ratio = cur_volume / avg_vol_20 if avg_vol_20 > 0 else 1.0
+
+        # 52-week high/low
+        w52_high = float(high.tail(252).max()) if len(high) >= 252 else float(high.max())
+        w52_low  = float(low.tail(252).min())  if len(low)  >= 252 else float(low.min())
+        pct_from_52h = ((cur_price - w52_high) / w52_high) * 100
+        pct_from_52l = ((cur_price - w52_low)  / w52_low)  * 100
+
+        # MACD (12, 26, 9) — pure pandas
+        ema12      = close.ewm(span=12, adjust=False).mean()
+        ema26      = close.ewm(span=26, adjust=False).mean()
+        macd_line  = ema12 - ema26
+        signal_line= macd_line.ewm(span=9, adjust=False).mean()
+        macd_bull  = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
+
+        # ATR (14-period)
+        tr     = pd.concat([high - low,
+                             (high - close.shift()).abs(),
+                             (low  - close.shift()).abs()], axis=1).max(axis=1)
+        atr_val = float(tr.tail(14).mean())
+        atr_pct = (atr_val / cur_price) * 100
+
+        # ── Scoring ─────────────────────────────────────────────────────────
+        # 8 possible signals — need 3+ for BUY, 2 for WATCH
+        signals = []
+        score   = 0
+
+        if roc_20 >= ROC_20_MIN:
+            score += 2  # strongest signal — already moving
+            signals.append(f"ROC +{roc_20:.1f}% in 20 days")
+
+        if RSI_MIN <= rsi_val <= RSI_MAX:
+            score += 1
+            signals.append(f"RSI {rsi_val:.0f} (momentum zone)")
+        elif rsi_val < RSI_MIN:
+            signals.append(f"RSI {rsi_val:.0f} (oversold — wait)")
+
+        if vol_ratio >= VOL_SPIKE_MIN:
+            score += 1
+            signals.append(f"Volume {vol_ratio:.1f}x avg (institutional)")
+
+        if cur_price > ma20:
+            score += 1
+            signals.append("Above MA20")
+
+        if cur_price > ma50:
+            score += 1
+            signals.append("Above MA50")
+
+        if macd_bull:
+            score += 1
+            signals.append("MACD bullish crossover")
+
+        if -5 <= pct_from_52h <= 0:
+            score += 1
+            signals.append(f"Near 52W high ({pct_from_52h:.1f}%)")
+
+        # Penalty: overbought or extreme move
+        if rsi_val > 80:
+            score -= 1
+            signals.append("⚠ RSI overbought")
+        if roc_20 > 40:
+            score -= 1
+            signals.append("⚠ Already up 40%+ — may be late")
+
+        # Action
+        if score >= SCORE_THRESHOLD:
+            action       = "BUY"
+            action_color = "#00A651"
+        elif score == 2:
+            action       = "WATCH"
+            action_color = "#E86A20"
+        elif roc_20 < -10:
+            action       = "AVOID"
+            action_color = "#E83820"
+        else:
+            return None  # not interesting enough to report
+
+        return {
+            "symbol":       sym.replace(".NS", "").replace(".BO", ""),
+            "exchange":     "BSE" if ".BO" in sym else "NSE",
+            "price":        round(cur_price, 2),
+            "roc_20":       round(roc_20, 1),
+            "rsi":          round(rsi_val, 1),
+            "vol_ratio":    round(vol_ratio, 1),
+            "ma20":         round(ma20, 2),
+            "ma50":         round(ma50, 2),
+            "w52_high":     round(w52_high, 2),
+            "w52_low":      round(w52_low, 2),
+            "pct_from_52h": round(pct_from_52h, 1),
+            "atr_pct":      round(atr_pct, 2),
+            "avg_vol":      int(avg_vol_20),
+            "signals":      signals,
+            "score":        score,
+            "action":       action,
+            "action_color": action_color,
+        }
+
+    except Exception as e:
+        return None
+
+
+def run_full_scan(symbols):
+    """Scan all symbols in batches and collect results."""
+    results   = []
+    failed    = []
+    total     = len(symbols)
+    batches   = [symbols[i:i+BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+
+    print(f"🔍 Scanning {total} stocks in {len(batches)} batches of {BATCH_SIZE}...\n")
+    t0 = time.time()
+
+    for idx, batch in enumerate(batches):
+        pct = (idx / len(batches)) * 100
+        print(f"  Batch {idx+1}/{len(batches)} ({pct:.0f}%) — {batch[0].split('.')[0]}..{batch[-1].split('.')[0]}", end="\r")
+
+        data = scan_batch(batch)
+        if data is None or data.empty:
+            failed.extend(batch)
+            time.sleep(SLEEP_BETWEEN)
             continue
 
-        for t in batch:
-            try:
-                sub = (data[t] if len(batch) > 1 else data).dropna()
-                scanned += 1
-                r = analyse(t.replace(".NS", ""), sub, bench)
-                if r:
-                    results.append(r)
-                    print(f"    {r['symbol']:12s} {r['setup']:18s} "
-                          f"RR {r['rr']}  est {r['est_days']}d")
-            except Exception:
-                pass
-        time.sleep(1.5)
+        for sym in batch:
+            result = analyse_symbol(sym, data)
+            if result:
+                results.append(result)
 
-    results.sort(key=lambda r: (-r["rr"], r["est_days"]))
-    return results, scanned
+        time.sleep(SLEEP_BETWEEN)  # be polite to Yahoo
 
+    elapsed = time.time() - t0
+    print(f"\n\n✅ Scan complete in {elapsed:.0f}s")
+    print(f"   Stocks scanned: {total - len(failed)}")
+    print(f"   Signals found:  {len(results)}")
+    print(f"   Failed:         {len(failed)}")
 
-# ── Publish ───────────────────────────────────────────────────────────────────
-def push_gist(payload):
-    if not (GIST_ID and GIST_TOKEN):
-        print("GIST_ID or GIST_TOKEN missing — dashboard will not update")
-        sys.exit(1)
-    r = requests.patch(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers={"Authorization": f"Bearer {GIST_TOKEN}",
-                 "Accept": "application/vnd.github+json",
-                 "User-Agent": "raja-scanner"},
-        json={"files": {GIST_FILE: {"content": json.dumps(payload)}}},
-        timeout=25,
-    )
-    if r.status_code != 200:
-        print(f"Gist update FAILED {r.status_code}: {r.text[:300]}")
-        sys.exit(1)
-    print(f"Gist updated — {len(payload['buy'])} candidates published")
+    return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
-def build_email(payload, vix):
-    buy, d = payload["buy"], payload["date"]
+# ── Step 3: Build email ───────────────────────────────────────────────────────
+def build_email(results, vix=None):
+    today    = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+    date_str = today.strftime("%A, %d %b %Y")
+    time_str = today.strftime("%I:%M %p IST")
+
+    buy    = [r for r in results if r["action"] == "BUY"]
+    watch  = [r for r in results if r["action"] == "WATCH"]
+
+    vix_color  = "#C41400" if vix and vix > 20 else "#1A7F37"
+    vix_bg     = "#FFF0EE" if vix and vix > 20 else "#EAFBEE"
+    vix_note   = f"VIX {vix:.1f} — {'HIGH: Pause new buys' if vix > 20 else 'Normal: OK to trade'}" if vix else "VIX unavailable"
+
+    action_text = ""
     if vix and vix > 20:
-        head, tone = (f"India VIX at {vix}. Hold cash — no new positions today.", "#B03A2E")
+        action_text = f"🚨 India VIX is {vix:.1f} — Above 20. Your rules say HOLD CASH. Do not deploy new capital today regardless of signals."
+        action_bg   = "#FFF0EE"
+        action_color= "#C41400"
     elif buy:
-        t = buy[0]
-        head, tone = (f"Best setup: {t['symbol']} at ₹{t['price']} — "
-                      f"stop ₹{t['stop']}, target ₹{t['target']}", "#1D6F4C")
+        top = buy[0]
+        action_text = f"✅ Deploy ₹10,000 into {top['symbol']} — {top['roc_20']:+.1f}% in 20 days, RSI {top['rsi']}, score {top['score']}/8"
+        action_bg   = "#EAFBEE"
+        action_color= "#1A7F37"
     else:
-        head, tone = ("No setups passed the filters today. Sit out.", "#B08D2E")
+        action_text = "⚠️ No strong BUY signals today — hold existing positions, do not force a trade."
+        action_bg   = "#FFF8E6"
+        action_color= "#8A6000"
 
-    rows = "".join(
-        f"""<tr>
-          <td style="padding:10px 8px;border-bottom:1px solid #D3DAE1">
-            <div style="font-weight:600;font-size:15px">{r['symbol']}</div>
-            <div style="font-size:12px;color:#5A6B7A">{r['setup']}</div></td>
-          <td style="padding:10px 8px;border-bottom:1px solid #D3DAE1;
-              text-align:right;font-family:monospace">₹{r['price']}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #D3DAE1;
-              text-align:right;font-family:monospace;color:#B03A2E">₹{r['stop']}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #D3DAE1;
-              text-align:right;font-family:monospace;color:#1D6F4C">₹{r['target']}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #D3DAE1;
-              text-align:right;font-family:monospace">{r['rr']}</td>
-          <td style="padding:10px 8px;border-bottom:1px solid #D3DAE1;
-              text-align:right;font-family:monospace">~{r['est_days']}d</td>
-        </tr>""" for r in buy[:10])
+    def stock_row(r, highlight=False):
+        bg = "#EAFBEE" if highlight else ("transparent")
+        signal_str = " · ".join(r["signals"][:3])
+        return f"""
+        <tr style="background:{bg};border-bottom:1px solid #eee">
+          <td style="padding:8px 12px;font-family:monospace;font-weight:700;font-size:13px">{r['symbol']}</td>
+          <td style="padding:8px 12px;font-family:monospace;font-size:12px;color:#666">{r['exchange']}</td>
+          <td style="padding:8px 12px;font-family:monospace;font-size:13px">₹{r['price']:,}</td>
+          <td style="padding:8px 12px;font-family:monospace;font-size:13px;color:{"#00A651" if r['roc_20']>=0 else "#C41400"};font-weight:700">{r['roc_20']:+.1f}%</td>
+          <td style="padding:8px 12px;font-size:12px;color:#555">{r['rsi']}</td>
+          <td style="padding:8px 12px;font-size:12px;color:#555">{r['vol_ratio']:.1f}x</td>
+          <td style="padding:8px 12px;font-size:11px;color:#666;max-width:300px">{signal_str}</td>
+          <td style="padding:8px 12px;text-align:center">
+            <span style="font-size:10px;font-weight:700;font-family:monospace;letter-spacing:.04em;
+              padding:3px 8px;border:1.5px solid {r['action_color']};
+              color:{r['action_color']};background:{r['action_color']}18">{r['action']}</span>
+          </td>
+        </tr>"""
 
-    return f"""<div style="font-family:-apple-system,Segoe UI,sans-serif;
-      max-width:720px;margin:0 auto;background:#EEF1F4;padding:28px;color:#16222E">
-      <div style="font-size:13px;color:#5A6B7A;margin-bottom:4px">{d}</div>
-      <h1 style="font-size:22px;margin:0 0 20px">Today's setups</h1>
-      <div style="border-left:3px solid {tone};padding:14px 16px;background:#fff;
-        font-size:16px;font-weight:600;color:{tone};margin-bottom:24px">{head}</div>
-      {'<table style="width:100%;border-collapse:collapse;background:#fff">'
-       '<tr><th align="left" style="padding:8px;font-size:12px;color:#5A6B7A">Stock</th>'
-       '<th align="right" style="padding:8px;font-size:12px;color:#5A6B7A">Price</th>'
-       '<th align="right" style="padding:8px;font-size:12px;color:#5A6B7A">Stop</th>'
-       '<th align="right" style="padding:8px;font-size:12px;color:#5A6B7A">Target</th>'
-       '<th align="right" style="padding:8px;font-size:12px;color:#5A6B7A">R:R</th>'
-       '<th align="right" style="padding:8px;font-size:12px;color:#5A6B7A">Est</th></tr>'
-       + rows + '</table>' if buy else ''}
-      <p style="font-size:13px;color:#5A6B7A;margin-top:24px">
-        Scanned {payload['total_scanned']} stocks.
-        <a href="https://rajaportfolio.com" style="color:#B08D2E">Open dashboard</a>
-      </p></div>"""
+    buy_rows   = "".join(stock_row(r, i == 0) for i, r in enumerate(buy[:10]))
+    watch_rows = "".join(stock_row(r) for r in watch[:5])
+    no_buy_msg = '<tr><td colspan="8" style="padding:14px;text-align:center;color:#999;font-family:monospace">No strong buy signals found today</td></tr>'
+
+    html = f"""
+    <div style="max-width:720px;margin:0 auto;font-family:Arial,sans-serif;font-size:14px;color:#333">
+
+      <div style="border-bottom:3px solid #0A0A0A;padding-bottom:12px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:flex-end">
+        <div>
+          <h1 style="font-size:16px;font-family:monospace;margin:0;letter-spacing:.1em;text-transform:uppercase">NSE + BSE Full Market Scan</h1>
+          <p style="font-size:12px;color:#666;margin:4px 0 0;font-family:monospace">{date_str} &nbsp;|&nbsp; {time_str}</p>
+        </div>
+        <span style="font-size:11px;font-weight:700;font-family:monospace;padding:4px 12px;border:1.5px solid {vix_color};color:{vix_color};background:{vix_bg}">{vix_note}</span>
+      </div>
+
+      <div style="background:{action_bg};border:1.5px solid {action_color};padding:16px 20px;margin-bottom:24px">
+        <div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:{action_color};margin-bottom:5px">Today's action</div>
+        <div style="font-size:15px;font-weight:700;color:{action_color};line-height:1.4">{action_text}</div>
+      </div>
+
+      <h3 style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#666;margin:0 0 10px">
+        Buy signals — {len(buy)} stocks found across NSE+BSE
+      </h3>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:12px;border:1px solid #eee">
+        <thead>
+          <tr style="background:#0A0A0A;color:#fff">
+            <th style="padding:8px 12px;text-align:left;font-family:monospace;font-size:10px;letter-spacing:.06em">Symbol</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">Exch</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">Price</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">20D ROC</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">RSI</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">Volume</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">Signals</th>
+            <th style="padding:8px 12px;text-align:left;font-size:10px">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {"".join(stock_row(r, i == 0) for i, r in enumerate(buy[:10])) if buy else no_buy_msg}
+        </tbody>
+      </table>
+
+      {'<h3 style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#666;margin:0 0 10px">Watch list — approaching breakout</h3><table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:12px;border:1px solid #eee"><thead><tr style="background:#0A0A0A;color:#fff"><th style="padding:8px 12px;text-align:left;font-family:monospace;font-size:10px">Symbol</th><th style="padding:8px 12px;text-align:left;font-size:10px">Exch</th><th style="padding:8px 12px;text-align:left;font-size:10px">Price</th><th style="padding:8px 12px;text-align:left;font-size:10px">20D ROC</th><th style="padding:8px 12px;text-align:left;font-size:10px">RSI</th><th style="padding:8px 12px;text-align:left;font-size:10px">Volume</th><th style="padding:8px 12px;text-align:left;font-size:10px">Signals</th><th style="padding:8px 12px;text-align:left;font-size:10px">Action</th></tr></thead><tbody>' + "".join(stock_row(r) for r in watch[:5]) + '</tbody></table>' if watch else ''}
+
+      <div style="background:#F7F7F5;border:1px solid #eee;padding:14px 18px;margin-bottom:20px;font-size:12px;color:#555;line-height:1.8">
+        <strong style="font-family:monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase">Scan stats</strong><br>
+        Stocks scanned: <strong>{len(results) + (0)}</strong> &nbsp;|&nbsp;
+        Buy signals: <strong>{len(buy)}</strong> &nbsp;|&nbsp;
+        Watch: <strong>{len(watch)}</strong> &nbsp;|&nbsp;
+        Top ROC: <strong>{f"{buy[0]['roc_20']:+.1f}%" if buy else "N/A"}</strong>
+      </div>
+
+      <p style="font-size:11px;color:#aaa;font-family:monospace;border-top:1px solid #eee;padding-top:12px">
+        rajaportfolio.com &nbsp;|&nbsp; Rules: +10-15% exit / 3 red days stop loss / 15d max hold / VIX&gt;20 hold cash<br>
+        Screened: ROC≥{ROC_20_MIN}%, RSI {RSI_MIN}-{RSI_MAX}, Volume≥{VOL_SPIKE_MIN}x, Score≥{SCORE_THRESHOLD}/8
+      </p>
+    </div>
+    """
+    return html, action_text
 
 
-def send_email(subject, html):
+# ── Step 4: Optional AI summary ───────────────────────────────────────────────
+def get_ai_summary(results, vix):
+    """Use Claude Haiku to write a 3-line market summary."""
+    if not ANTHROPIC_KEY:
+        return ""
+    try:
+        top5 = results[:5]
+        prompt = (
+            f"India VIX: {vix}. Top 5 NSE/BSE momentum stocks today: "
+            + ", ".join(f"{r['symbol']} ({r['roc_20']:+.1f}% ROC, RSI {r['rsi']}, signals: {', '.join(r['signals'][:2])})" for r in top5)
+            + ". Write a 2-sentence market context for a swing trader. Be direct, no fluff."
+        )
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
+            timeout=15,
+        )
+        return resp.json()["content"][0]["text"]
+    except Exception:
+        return ""
+
+
+# ── Step 5: Send email ────────────────────────────────────────────────────────
+def send_email(subject, html_body):
     if not RESEND_API_KEY:
-        print("No RESEND_API_KEY — skipping email")
-        return
-    r = requests.post("https://api.resend.com/emails",
-                      headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-                      json={"from": EMAIL_FROM, "to": EMAIL_TO,
-                            "subject": subject, "html": html}, timeout=20)
-    print("Email sent" if r.status_code in (200, 201) else f"Email failed: {r.text[:200]}")
+        print("⚠️  No RESEND_API_KEY set — printing email to stdout only")
+        return False
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={"from": EMAIL_FROM, "to": EMAIL_TO, "subject": subject, "html": html_body},
+        timeout=15,
+    )
+    if resp.status_code in (200, 201):
+        print(f"✅ Email sent to {EMAIL_TO}")
+        return True
+    else:
+        print(f"❌ Email failed: {resp.text}")
+        return False
+
+
+# ── Step 6: Save results to JSON ──────────────────────────────────────────────
+def save_results(results):
+    os.makedirs("results", exist_ok=True)
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    path = "results/scan_" + date_str + ".json"
+
+    dashboard_data = {
+        "date":          date_str,
+        "ts":            datetime.datetime.utcnow().isoformat() + "Z",
+        "buy":           [r for r in results if r["action"] == "BUY"][:20],
+        "watch":         [r for r in results if r["action"] == "WATCH"][:10],
+        "total_scanned": len(results),
+    }
+
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2)
+    with open("results/latest.json", "w") as f:
+        json.dump(dashboard_data, f)
+    print("Saved to " + path)
+
+    # Push to GitHub Gist so Cloudflare dashboard can fetch it
+    # NOTE: must be GIST_TOKEN, not GITHUB_TOKEN. GitHub rejects user-defined
+    # secrets starting with GITHUB_, and its built-in token has no gist scope.
+    gist_id    = os.environ.get("GIST_ID", "")
+    gist_token = os.environ.get("GIST_TOKEN", "")
+
+    if not gist_id or not gist_token:
+        print("ERROR: GIST_ID or GIST_TOKEN not set - dashboard will not update")
+        sys.exit(1)
+
+    try:
+        resp = requests.patch(
+            "https://api.github.com/gists/" + gist_id,
+            headers={"Authorization": "Bearer " + gist_token,
+                     "Accept": "application/vnd.github+json",
+                     "User-Agent": "raja-scanner"},
+            json={"files": {"raja_scan_latest.json": {"content": json.dumps(dashboard_data)}}},
+            timeout=25,
+        )
+        if resp.status_code == 200:
+            print("Gist updated OK - buy=%d watch=%d scanned=%d" % (
+                len(dashboard_data["buy"]), len(dashboard_data["watch"]),
+                dashboard_data["total_scanned"]))
+        else:
+            # Fail loudly so the workflow goes red instead of silently green
+            print("ERROR: Gist update failed %s: %s" % (resp.status_code, resp.text[:300]))
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("ERROR: Gist push failed: " + str(e))
+        sys.exit(1)
+
+    return path
+
+
+# ── Fallback symbol list (if NSE website blocks) ──────────────────────────────
+FALLBACK_SYMBOLS = [
+    # Nifty 50
+    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJAJFINSV",
+    "BAJFINANCE","BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY",
+    "EICHERMOT","GRASIM","HCLTECH","HDFCBANK","HDFCLIFE","HEROMOTOCO","HINDALCO","HINDUNILVR",
+    "ICICIBANK","INDUSINDBK","INFY","ITC","JSWSTEEL","KOTAKBANK","LT","M&M","MARUTI",
+    "NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBILIFE","SBIN","SHRIRAMFIN",
+    "SUNPHARMA","TATACONSUM","TATAMOTORS","TATASTEEL","TCS","TECHM","TITAN","ULTRACEMCO",
+    "WIPRO","INDIGO",
+    # Nifty Next 50
+    "ABB","ADANIGREEN","ADANIPOWER","AMBUJACEM","BAJAJHLDNG","BANKBARODA","BERGEPAINT",
+    "BOSCHLTD","CANBK","CHOLAFIN","COLPAL","DABUR","DLF","DMART","GAIL","GODREJCP",
+    "GODREJPROP","HAVELLS","HAL","ICICIGI","ICICIPRULI","INDHOTEL","IOC","IRCTC","JINDALSTEL",
+    "JUBLFOOD","LICHSGFIN","LICI","LUPIN","MARICO","MFSL","MUTHOOTFIN","NAUKRI","NHPC",
+    "NMDC","OFSS","PAGEIND","PIDILITIND","PIIND","PNB","RECLTD","SAIL","SIEMENS",
+    "SRF","TATAPOWER","TORNTPHARM","TRENT","TVSMOTOR","UBL","VEDL","ZYDUSLIFE",
+    # Midcap momentum stocks
+    "ABCAPITAL","APLAPOLLO","ASTRAL","AUBANK","BALRAMCHIN","BATAINDIA","BEL","BHARATFORG",
+    "BIKAJI","BLUEDART","CAMS","CANFINHOME","CASTROLIND","CDSL","CESC","CGPOWER",
+    "CLEAN","COCHINSHIP","CONCOR","COROMANDEL","CROMPTON","CUMMINSIND","CYIENT",
+    "DATAPATTNS","DEEPAKNTR","DIXON","EDELWEISS","EMAMILTD","ESCORTS","EXIDEIND",
+    "FEDERALBNK","FINCABLES","FLUOROCHEM","GICRE","GLAXO","GMRINFRA","GNFC",
+    "GODREJAGRO","GRANULES","GRINDWELL","GUJGASLTD","HAPPSTMNDS","HSCL","IBREALEST",
+    "IDBI","IDFCFIRSTB","IIFL","INDIGOPNTS","IRB","IREDA","ISGEC","IEX",
+    "JKCEMENT","JKTYRE","JMFINANCIL","JUBLINGREA","KALYANKJIL","KANSAINER","KEI",
+    "KFINTECH","KINETIC","KIOCL","KIRLOSENG","KNRCON","KPITTECH","KRBL","LAURUSLABS",
+    "LICHSGFIN","LODHA","LXCHEM","MAHABANK","MAHINDCIE","MANAPPURAM","MARICO",
+    "MASTEK","MAXHEALTH","MCDOWELL-N","MEDANTA","METROBRAND","MINDTREE","MGL",
+    "MOTHERSON","MPHASIS","MRPL","NATCOPHARM","NBCC","NIACL","NLCINDIA","NOCIL",
+    "NUVAMA","OLECTRA","ORIENTCEM","PAYTM","PERSISTENT","PETRONET","PFIZER",
+    "PHOENIXLTD","POLYMED","POONAWALLA","PRESTIGE","PRINCEPIPE","PRIVISCL","PSPPROJECT",
+    "RAILTEL","RAJESHEXPO","RAMCOCEM","RBLBANK","RITES","ROUTE","SAFARI",
+    "SAPPHIRE","SCHAEFFLER","SEQUENT","SHYAMMETL","SOBHA","SPARC","SPICEJET",
+    "STAR","STLTECH","SUMICHEM","SUNDARMFIN","SUNDRMFAST","SUPREMEIND","SUVENPHAR",
+    "TANLA","TATACHEM","TATACOMM","TATAINVEST","TATATECH","TCPL","TECHNOE",
+    "THYROCARE","TIINDIA","TIMKEN","TITAGARH","TORNTPOWER","TRIVENI","TRIDENT",
+    "UCOBANK","UJJIVANSFB","UNION","UNIONBANK","UTIAMC","V2RETAIL","VAIBHAVGBL",
+    "VARDHMANTEXT","VGUARD","VINATIORGA","VIPIND","VOLTAMP","VSTIND","WELCORP",
+    "WELSPUNLIV","WHIRLPOOL","WINDLAS","WOCKPHARMA","XPRO","YATHARTH","ZENSARTECH",
+    "ZENTEC","ZOMATO","ZUARI",
+]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    start = time.time()
-    today = datetime.date.today()
-    print(f"Raja Swing Scanner — {today}\n")
+    print("=" * 60)
+    print("  Raja's NSE+BSE Full Market Scanner")
+    print(f"  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
+    print("=" * 60 + "\n")
 
-    vix   = get_vix()
-    bench = get_benchmark()
-    print(f"India VIX: {vix}   Nifty 60d: "
-          f"{f'{bench:+.1f}%' if bench is not None else 'n/a'}\n")
+    # Get VIX (optional - fallback to None)
+    vix = None
+    try:
+        vix_data = yf.download("^INDIAVIX", period="2d", interval="1d", progress=False)
+        vix = float(vix_data["Close"].iloc[-1])
+        print(f"📊 India VIX: {vix:.1f} ({'⚠ HIGH' if vix > 20 else '✅ Normal'})\n")
+    except Exception:
+        print("📊 VIX fetch failed — continuing without\n")
 
-    symbols = get_universe()
-    results, scanned = run_scan(symbols, bench)
+    # Build symbol universe
+    if TEST_MODE:
+        print("🧪 TEST MODE — using 30 stocks only\n")
+        symbols = [s + ".NS" for s in FALLBACK_SYMBOLS[:30]]
+    else:
+        nse_syms = get_nse_symbols()
+        bse_syms = get_bse_symbols()
+        # Combine NSE + BSE, deduplicate by base symbol
+        symbols = nse_syms + [s for s in bse_syms if s.replace(".BO", "") not in
+                              {n.replace(".NS", "") for n in nse_syms}]
+        print(f"📋 Total universe: {len(symbols)} stocks (NSE + BSE combined)\n")
 
-    payload = {
-        "date":          today.strftime("%d %b %Y"),
-        "ts":            datetime.datetime.utcnow().isoformat() + "Z",
-        "vix":           vix,
-        "total_scanned": scanned,
-        "target_pct":    TARGET_PCT,
-        "stop_pct":      STOP_PCT,
-        "buy":           results[:20],
-        "watch":         [],
-    }
+    # Run scan
+    results = run_full_scan(symbols)
 
-    os.makedirs("results", exist_ok=True)
-    with open(f"results/scan_{today}.json", "w") as f:
-        json.dump(payload, f, indent=2)
+    # Save results
+    save_results(results)
 
-    push_gist(payload)
-    send_email(f"{len(results)} setups — {today.strftime('%d %b')}",
-               build_email(payload, vix))
+    # Print top results to console
+    buy   = [r for r in results if r["action"] == "BUY"]
+    watch = [r for r in results if r["action"] == "WATCH"]
 
-    print(f"\nDone in {time.time() - start:.0f}s — "
-          f"{scanned} scanned, {len(results)} passed all four gates")
+    print(f"\n{'='*60}")
+    print(f"TOP BUY SIGNALS ({len(buy)} found):")
+    print(f"{'='*60}")
+    for r in buy[:10]:
+        print(f"  {r['symbol']:15} ₹{r['price']:>8,.0f}  ROC:{r['roc_20']:>+6.1f}%  RSI:{r['rsi']:>5.0f}  Vol:{r['vol_ratio']:.1f}x  Score:{r['score']}/8")
+        print(f"  {'':15} {' · '.join(r['signals'][:3])}")
+        print()
+
+    if watch:
+        print(f"\nWATCH LIST ({len(watch)} stocks approaching breakout):")
+        for r in watch[:5]:
+            print(f"  {r['symbol']:15} ₹{r['price']:>8,.0f}  ROC:{r['roc_20']:>+6.1f}%  RSI:{r['rsi']:>5.0f}")
+
+    # Build and send email
+    html_body, action_text = build_email(results, vix)
+
+    today     = datetime.date.today().strftime("%d %b %Y")
+    buy_count = len(buy)
+    subject   = f"Market Scan {today} — {buy_count} buy signal{'s' if buy_count != 1 else ''}"
+    if vix and vix > 20:
+        subject = f"⚠ Market Scan {today} — VIX {vix:.1f} HIGH — Hold cash"
+
+    send_email(subject, html_body)
+    print(f"\n✅ Done. Action: {action_text}")
 
 
 if __name__ == "__main__":
