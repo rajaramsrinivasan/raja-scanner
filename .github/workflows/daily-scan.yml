@@ -1,19 +1,21 @@
-name: Raja Daily Market Scanner
+name: Daily Swing Scan
 
 on:
   schedule:
-    - cron: "45 3 * * 1-5"
+    - cron: "45 3 * * 1-5"      # 09:15 IST, weekdays
   workflow_dispatch:
     inputs:
       test_mode:
-        description: "Test mode - 30 stocks only?"
+        description: "Test mode - 40 stocks only?"
         required: false
         default: "false"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -25,17 +27,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install yfinance pandas requests
+        run: pip install yfinance pandas numpy requests
 
       - name: Run scanner
         env:
-          RESEND_API_KEY:    ${{ secrets.RESEND_API_KEY }}
-          EMAIL_FROM:        ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO:          ${{ secrets.EMAIL_TO }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GIST_ID:           ${{ secrets.GIST_ID }}
-          GITHUB_TOKEN:      ${{ secrets.GH_PAT }}
-          GH_USERNAME:       ${{ secrets.GH_USERNAME }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          GIST_ID:        ${{ secrets.GIST_ID }}
+          GIST_TOKEN:     ${{ secrets.GIST_TOKEN }}
         run: |
           if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
             python scanner.py --test
@@ -47,6 +47,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scan-results-${{ github.run_id }}
+          name: scan-${{ github.run_id }}
           path: results/
           retention-days: 30
