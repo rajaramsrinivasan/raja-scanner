@@ -31,6 +31,10 @@ RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
 EMAIL_FROM      = os.environ.get("EMAIL_FROM", "briefing@rajaportfolio.com")
 EMAIL_TO        = os.environ.get("EMAIL_TO", "pss.rajaram@gmail.com")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+# The Cloudflare worker now sends the single daily email, because it is the only
+# place that knows the portfolio. Set SCANNER_EMAIL=true to get this one too,
+# which is useful when debugging a scan in isolation.
+SEND_SCANNER_EMAIL = os.environ.get("SCANNER_EMAIL", "").lower() == "true"
 
 TEST_MODE       = "--test" in sys.argv
 HISTORY_PERIOD  = "1y"   # need ~250 sessions for a real 52-week high (was "2mo")
@@ -280,6 +284,13 @@ def analyse_symbol(sym, data):
         cur_price  = float(close.iloc[-1])
         cur_volume = float(volume.iloc[-1])
 
+        # Date of the most recent bar. On a weekend run this is Friday's close,
+        # and the email needs to say so rather than implying it is live.
+        try:
+            as_of = str(df.index[-1])[:10]
+        except Exception:
+            as_of = ""
+
         # Price filter
         if cur_price < MIN_PRICE or cur_price > MAX_PRICE:
             return None
@@ -468,6 +479,7 @@ def analyse_symbol(sym, data):
             "atr_pct":      round(atr_pct, 2),
             "avg_vol":      int(avg_vol_20),
             "hist_days":    hist_days,
+            "as_of":        as_of,
             "signals":      signals,
             "score":        score,
             "action":       action,
@@ -536,6 +548,15 @@ def build_email(results, vix=None):
     buy    = [r for r in results if r["action"] == "BUY"]
     watch  = [r for r in results if r["action"] == "WATCH"]
 
+    # Is the newest price bar actually today? If not, this is a review of the
+    # last session's close, not a live signal.
+    data_date = max([r.get("as_of", "") for r in results] or [""])
+    today_iso = datetime.date.today().isoformat()
+    is_live   = (data_date == today_iso)
+    stale_note = "" if is_live else (
+        f' <span style="font-size:10px;font-weight:400;color:#8A6000">'
+        f'(prices as of {data_date} close)</span>')
+
     vix_color  = "#C41400" if vix and vix > 20 else "#1A7F37"
     vix_bg     = "#FFF0EE" if vix and vix > 20 else "#EAFBEE"
     vix_note   = f"VIX {vix:.1f} — {'HIGH: Pause new buys' if vix > 20 else 'Normal: OK to trade'}" if vix else "VIX unavailable"
@@ -545,6 +566,15 @@ def build_email(results, vix=None):
         action_text = f"🚨 India VIX is {vix:.1f} — Above 20. Your rules say HOLD CASH. Do not deploy new capital today regardless of signals."
         action_bg   = "#FFF0EE"
         action_color= "#C41400"
+    elif buy and not is_live:
+        top = buy[0]
+        action_text = (
+            f"Market closed — this is a review of the {data_date} close, not a signal to act on. "
+            f"Top candidate for the next session: {top['symbol']} "
+            f"({top['roc_20']:+.1f}% in 20 days, RSI {top['rsi']}, score {top['score']}/8)."
+        )
+        action_bg   = "#FFF8E6"
+        action_color= "#8A6000"
     elif buy:
         top = buy[0]
         action_text = f"✅ Deploy ₹10,000 into {top['symbol']} — {top['roc_20']:+.1f}% in 20 days, RSI {top['rsi']}, score {top['score']}/8"
@@ -590,12 +620,12 @@ def build_email(results, vix=None):
       </div>
 
       <div style="background:{action_bg};border:1.5px solid {action_color};padding:16px 20px;margin-bottom:24px">
-        <div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:{action_color};margin-bottom:5px">Today's action</div>
+        <div style="font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:{action_color};margin-bottom:5px">{"Today's action" if is_live else "Market closed"}</div>
         <div style="font-size:15px;font-weight:700;color:{action_color};line-height:1.4">{action_text}</div>
       </div>
 
       <h3 style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#666;margin:0 0 10px">
-        Buy signals — {len(buy)} stocks found across NSE+BSE
+        Buy signals — {len(buy)} stocks found across NSE+BSE{stale_note}
       </h3>
       <table style="width:100%;border-collapse:collapse;margin-bottom:24px;font-size:12px;border:1px solid #eee">
         <thead>
@@ -778,8 +808,10 @@ def main():
     # Get VIX (optional - fallback to None)
     vix = None
     try:
-        vix_data = yf.download("^INDIAVIX", period="2d", interval="1d", progress=False)
-        vix = float(vix_data["Close"].iloc[-1])
+        # period="2d" returns an empty frame on weekends and holidays, which is
+        # why the email kept saying "VIX unavailable". 5d always spans a session.
+        vix_data = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
+        vix = float(vix_data["Close"].dropna().iloc[-1])
         print(f"📊 India VIX: {vix:.1f} ({'⚠ HIGH' if vix > 20 else '✅ Normal'})\n")
     except Exception:
         print("📊 VIX fetch failed — continuing without\n")
@@ -828,7 +860,11 @@ def main():
     if vix and vix > 20:
         subject = f"⚠ Market Scan {today} — VIX {vix:.1f} HIGH — Hold cash"
 
-    send_email(subject, html_body)
+    if SEND_SCANNER_EMAIL:
+        send_email(subject, html_body)
+    else:
+        print("Skipping scanner email — the worker sends the daily one. "
+              "Set SCANNER_EMAIL=true to enable this as well.")
     print(f"\n✅ Done. Action: {action_text}")
 
 
