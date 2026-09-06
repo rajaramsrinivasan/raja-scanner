@@ -13,7 +13,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60   # 1y of history per batch is a bigger payload than 2mo
 
     steps:
       - name: Checkout code
@@ -34,7 +34,10 @@ jobs:
           EMAIL_TO:          ${{ secrets.EMAIL_TO }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GIST_ID:           ${{ secrets.GIST_ID }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN is reserved: Actions injects its own scoped token under
+          # that name and it cannot write Gists. Use a PAT with the "gist" scope,
+          # stored as a repo secret named GIST_TOKEN.
+          GIST_TOKEN:        ${{ secrets.GIST_TOKEN }}
           GH_USERNAME:       ${{ secrets.GH_USERNAME }}
         run: |
           if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
