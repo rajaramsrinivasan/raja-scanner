@@ -19,6 +19,7 @@ import yfinance as yf
 import pandas as pd
 import requests
 import json
+import math
 import os
 import sys
 import time
@@ -32,6 +33,7 @@ EMAIL_TO        = os.environ.get("EMAIL_TO", "pss.rajaram@gmail.com")
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 
 TEST_MODE       = "--test" in sys.argv
+HISTORY_PERIOD  = "1y"   # need ~250 sessions for a real 52-week high (was "2mo")
 BATCH_SIZE      = 50     # fetch 50 stocks at once (safe for Yahoo rate limits)
 SLEEP_BETWEEN   = 2      # seconds between batches
 MIN_PRICE       = 50     # ignore penny stocks below ₹50
@@ -44,6 +46,13 @@ VOL_SPIKE_MIN   = 2.0    # volume must be 2x+ 20-day average
 RSI_MIN         = 45     # RSI lower bound (not oversold)
 RSI_MAX         = 72     # RSI upper bound (not overbought)
 SCORE_THRESHOLD = 3      # minimum score to appear in BUY signals
+
+# Trend regression / forecast
+TREND_WINDOW    = 20     # sessions in the linear regression
+TREND_R2_MIN    = 40     # below this the fit is too loose to project from
+PROJ_DAYS       = 15     # forecast horizon
+PROJ_CAP        = 25.0   # cap the projection at +/-25% — extrapolation explodes
+TOP_N           = 25     # how many buy signals to publish for the dashboard
 
 
 # ── Step 1: Build full NSE + BSE universe ─────────────────────────────────────
@@ -136,7 +145,99 @@ def get_bse_symbols():
 
 
 # ── Step 2: Scan in batches ───────────────────────────────────────────────────
-def scan_batch(symbols, period="2mo"):
+def linreg(values):
+    """
+    Least-squares fit over a price series.
+    Returns (pct_per_day, r2_as_0_100) or (None, None) if there is not enough data.
+    """
+    n = len(values)
+    if n < 5:
+        return None, None
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(values) / n
+    ss_xx = ss_xy = ss_yy = 0.0
+    for i, y in enumerate(values):
+        dx = i - x_mean
+        dy = y - y_mean
+        ss_xx += dx * dx
+        ss_xy += dx * dy
+        ss_yy += dy * dy
+    if ss_xx == 0 or y_mean == 0:
+        return None, None
+    slope = ss_xy / ss_xx                       # price units per day
+    r2 = (ss_xy ** 2) / (ss_xx * ss_yy) if ss_yy > 0 else 0.0
+    return (slope / y_mean) * 100.0, round(r2 * 100)
+
+
+def flag(value, green, amber, higher_is_better=True):
+    """Three-state flag for a metric: 'on' (good), 'mid' (ok), 'off' (weak)."""
+    if higher_is_better:
+        if value >= green:
+            return "on"
+        return "mid" if value >= amber else "off"
+    if value <= green:
+        return "on"
+    return "mid" if value <= amber else "off"
+
+
+def build_rationale(r):
+    """
+    One or two plain sentences explaining the 15-day range, built from the
+    metric flags. Deterministic — no API call, no cost, same text every run
+    for the same inputs.
+    """
+    f = r["flags"]
+    strengths, caveats = [], []
+
+    if f["momentum"] == "on":
+        strengths.append("it is already up %.1f%% over 20 sessions" % r["roc_20"])
+    elif f["momentum"] == "mid":
+        caveats.append("the %.1f%% move is only just at the threshold" % r["roc_20"])
+
+    if f["volume"] == "on":
+        strengths.append("%.1fx average volume confirms the move" % r["vol_ratio"])
+    elif f["volume"] == "off":
+        caveats.append("volume at %.1fx average means the move is unconfirmed" % r["vol_ratio"])
+
+    if f["trend"] == "on":
+        strengths.append("price sits above both the 20 and 50-day averages")
+    elif f["trend"] == "mid":
+        caveats.append("it has reclaimed MA20 but not MA50, so the medium-term trend has not turned")
+    else:
+        caveats.append("price is below both moving averages")
+
+    if f["rsi"] == "on":
+        strengths.append("RSI %.0f is inside the momentum band" % r["rsi"])
+    elif r["rsi"] > RSI_MAX:
+        caveats.append("RSI %.0f is stretched and often pulls back before the next leg" % r["rsi"])
+    else:
+        caveats.append("RSI %.0f is still weak" % r["rsi"])
+
+    if f["position"] == "on":
+        strengths.append("it is within %.1f%% of its 52-week high" % abs(r["pct_from_52h"]))
+    elif f["position"] == "mid":
+        strengths.append("there is %.0f%% of headroom before the 52-week high" % abs(r["pct_from_52h"]))
+
+    if r["trend_r2"] < TREND_R2_MIN:
+        caveats.append("the trend line fits poorly (r2 %d%%), so the range is wide" % r["trend_r2"])
+
+    lead = "Scores %d/8 but nothing here is confirming." % r["score"]
+    if strengths:
+        lead = strengths[0][0].upper() + strengths[0][1:]
+        if len(strengths) > 1:
+            lead += ", and " + strengths[1]
+        lead += "."
+
+    tail = ""
+    if caveats:
+        tail = " The catch: " + caveats[0] + "."
+        if len(caveats) > 1:
+            tail = " The catch: " + caveats[0] + "; " + caveats[1] + "."
+
+    return lead + tail
+
+
+def scan_batch(symbols, period=HISTORY_PERIOD):
     """Download OHLCV for a batch and return cleaned DataFrame."""
     try:
         data = yf.download(
@@ -214,8 +315,11 @@ def analyse_symbol(sym, data):
         vol_ratio = cur_volume / avg_vol_20 if avg_vol_20 > 0 else 1.0
 
         # 52-week high/low
-        w52_high = float(high.tail(252).max()) if len(high) >= 252 else float(high.max())
-        w52_low  = float(low.tail(252).min())  if len(low)  >= 252 else float(low.min())
+        # With HISTORY_PERIOD="1y" this is a genuine 52-week window. On a short
+        # history it falls back to whatever exists, and hist_days records that.
+        hist_days = len(close)
+        w52_high = float(high.tail(252).max())
+        w52_low  = float(low.tail(252).min())
         pct_from_52h = ((cur_price - w52_high) / w52_high) * 100
         pct_from_52l = ((cur_price - w52_low)  / w52_low)  * 100
 
@@ -232,6 +336,38 @@ def analyse_symbol(sym, data):
                              (low  - close.shift()).abs()], axis=1).max(axis=1)
         atr_val = float(tr.tail(14).mean())
         atr_pct = (atr_val / cur_price) * 100
+
+        # ── Trend regression over the last TREND_WINDOW sessions ────────────
+        window = [float(v) for v in close.tail(TREND_WINDOW)]
+        slope_pct, trend_r2 = linreg(window)
+        if slope_pct is None:
+            slope_pct, trend_r2 = 0.0, 0
+
+        if trend_r2 < 30:
+            trend_label = "Sideways"
+        elif slope_pct >= 0.5:
+            trend_label = "Strong uptrend"
+        elif slope_pct >= 0.15:
+            trend_label = "Uptrend"
+        elif slope_pct >= -0.1:
+            trend_label = "Sideways"
+        else:
+            trend_label = "Downtrend"
+
+        # 15-day projection from the fitted slope
+        proj_15 = cur_price * ((1 + slope_pct / 100.0) ** PROJ_DAYS)
+        pct_15  = ((proj_15 - cur_price) / cur_price) * 100.0
+        pct_15  = max(-PROJ_CAP, min(PROJ_CAP, pct_15))
+        proj_15 = cur_price * (1 + pct_15 / 100.0)
+
+        # Range, not a point. Width scales with the stock's own volatility and
+        # widens further when the regression fits badly.
+        vol_15   = atr_pct * math.sqrt(PROJ_DAYS)
+        widen    = 1.5 - (trend_r2 / 200.0)          # r2 0 -> 1.5x, r2 100 -> 1.0x
+        half     = max(1.5, min(0.5 * vol_15 * widen, 12.0))
+        exp_low  = round(pct_15 - half, 1)
+        exp_high = round(pct_15 + half, 1)
+        forecast_ok = trend_r2 >= TREND_R2_MIN
 
         # ── Scoring ─────────────────────────────────────────────────────────
         # 8 possible signals — need 3+ for BUY, 2 for WATCH
@@ -276,18 +412,46 @@ def analyse_symbol(sym, data):
             score -= 1
             signals.append("⚠ Already up 40%+ — may be late")
 
-        # Action
-        if score >= SCORE_THRESHOLD:
+        # ── Action ──────────────────────────────────────────────────────────
+        # AVOID is tested first: previously it sat after the score branches, so
+        # a falling stock that scraped 3 points was still labelled BUY.
+        demoted = False
+        falling = (slope_pct < 0) or (pct_15 < 0) or (trend_label == "Downtrend")
+        if roc_20 <= -10 or falling:
+            if score < SCORE_THRESHOLD:
+                action       = "AVOID"
+                action_color = "#E83820"
+            else:
+                # Scores well but the trend points down — cap it at WATCH.
+                action       = "WATCH"
+                action_color = "#E86A20"
+                demoted      = True
+                signals.append("Demoted — 20-day trend is negative")
+        elif score >= SCORE_THRESHOLD:
             action       = "BUY"
             action_color = "#00A651"
         elif score == 2:
             action       = "WATCH"
             action_color = "#E86A20"
-        elif roc_20 < -10:
-            action       = "AVOID"
-            action_color = "#E83820"
         else:
             return None  # not interesting enough to report
+
+        # ── Five metric flags the dashboard renders ─────────────────────────
+        if cur_price > ma20 and cur_price > ma50:
+            trend_flag = "on"
+        elif cur_price > ma20:
+            trend_flag = "mid"
+        else:
+            trend_flag = "off"
+
+        flags = {
+            "momentum": flag(roc_20,    ROC_20_MIN,    5.0),
+            "rsi":      "on" if RSI_MIN <= rsi_val <= RSI_MAX
+                        else ("mid" if rsi_val <= 80 else "off"),
+            "volume":   flag(vol_ratio, VOL_SPIKE_MIN, 1.2),
+            "trend":    trend_flag,
+            "position": flag(abs(pct_from_52h), 5.0, 15.0, higher_is_better=False),
+        }
 
         return {
             "symbol":       sym.replace(".NS", "").replace(".BO", ""),
@@ -303,10 +467,22 @@ def analyse_symbol(sym, data):
             "pct_from_52h": round(pct_from_52h, 1),
             "atr_pct":      round(atr_pct, 2),
             "avg_vol":      int(avg_vol_20),
+            "hist_days":    hist_days,
             "signals":      signals,
             "score":        score,
             "action":       action,
             "action_color": action_color,
+            "demoted":      demoted,
+            "flags":        flags,
+            # Trend + forecast
+            "slope_pct":    round(slope_pct, 3),
+            "trend_r2":     trend_r2,
+            "trend_label":  trend_label,
+            "proj_15":      round(proj_15, 2),
+            "pct_15":       round(pct_15, 1),
+            "exp_low":      exp_low,
+            "exp_high":     exp_high,
+            "forecast_ok":  forecast_ok,
         }
 
     except Exception as e:
@@ -336,6 +512,7 @@ def run_full_scan(symbols):
         for sym in batch:
             result = analyse_symbol(sym, data)
             if result:
+                result["rationale"] = build_rationale(result)
                 results.append(result)
 
         time.sleep(SLEEP_BETWEEN)  # be polite to Yahoo
@@ -346,7 +523,8 @@ def run_full_scan(symbols):
     print(f"   Signals found:  {len(results)}")
     print(f"   Failed:         {len(failed)}")
 
-    return sorted(results, key=lambda x: x["score"], reverse=True)
+    # Score first, then the projected 15-day return as the tie-breaker.
+    return sorted(results, key=lambda x: (x["score"], x["pct_15"]), reverse=True)
 
 
 # ── Step 3: Build email ───────────────────────────────────────────────────────
@@ -507,8 +685,10 @@ def save_results(results):
     dashboard_data = {
         "date":          date_str,
         "ts":            datetime.datetime.utcnow().isoformat() + "Z",
-        "buy":           [r for r in results if r["action"] == "BUY"][:20],
+        "buy":           [r for r in results if r["action"] == "BUY"][:TOP_N],
         "watch":         [r for r in results if r["action"] == "WATCH"][:10],
+        "top25":         [r for r in results if r["action"] == "BUY"][:TOP_N],
+        "qualifying":    len([r for r in results if r["action"] == "BUY"]),
         "total_scanned": len(results),
     }
 
@@ -520,7 +700,11 @@ def save_results(results):
 
     # Push to GitHub Gist so Cloudflare dashboard can fetch it
     gist_id    = os.environ.get("GIST_ID", "")
-    github_pat = os.environ.get("GITHUB_TOKEN", "")
+    # GITHUB_TOKEN is injected by Actions and has no gist scope — it will never
+    # work here. Use a personal access token with the "gist" scope instead.
+    github_pat = os.environ.get("GIST_TOKEN", "") or os.environ.get("GH_PAT", "")
+    if not github_pat:
+        print("No GIST_TOKEN set — skipping Gist push. The dashboard will show a stale scan.")
     if gist_id and github_pat:
         try:
             resp = requests.patch(
@@ -534,7 +718,7 @@ def save_results(results):
                 raw = "https://gist.githubusercontent.com/" + os.environ.get("GH_USERNAME","rajaramsrinivasan") + "/" + gist_id + "/raw/raja_scan_latest.json"
                 print("Gist updated: " + raw)
             else:
-                print("Gist update failed: " + str(resp.status_code))
+                print("Gist update failed: " + str(resp.status_code) + " " + resp.text[:200])
         except Exception as e:
             print("Gist push failed: " + str(e))
     return path
