@@ -2,7 +2,10 @@ name: Raja Daily Market Scanner
 
 on:
   schedule:
-    - cron: "45 3 * * 1-5"
+    # 8:15 AM IST. Runs before the worker emails at 9:20 so the Gist it reads
+    # is today's scan, not yesterday's. A 1,800-stock scan with 1y of history
+    # takes roughly 20-30 minutes.
+    - cron: "45 2 * * 1-5"
   workflow_dispatch:
     inputs:
       test_mode:
