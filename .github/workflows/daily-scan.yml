@@ -2,9 +2,8 @@ name: Raja Daily Market Scanner
 
 on:
   schedule:
-    # 8:15 AM IST. Runs before the worker emails at 9:20 so the Gist it reads
-    # is today's scan, not yesterday's. A 1,800-stock scan with 1y of history
-    # takes roughly 20-30 minutes.
+    # 8:15 AM IST. Must finish before the worker emails at 9:20, or the email
+    # reads yesterday's Gist. A full scan with 1y of history takes 20-30 min.
     - cron: "45 2 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -37,10 +36,12 @@ jobs:
           EMAIL_TO:          ${{ secrets.EMAIL_TO }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GIST_ID:           ${{ secrets.GIST_ID }}
-          # GITHUB_TOKEN is reserved: Actions injects its own scoped token under
-          # that name and it cannot write Gists. Use a PAT with the "gist" scope,
-          # stored as a repo secret named GIST_TOKEN.
+          # GITHUB_TOKEN is a reserved name: Actions injects its own scoped
+          # token under it and that token cannot write Gists. scanner.py reads
+          # GIST_TOKEN first, then falls back to GH_PAT. Both are passed here so
+          # whichever exists is used. The PAT needs the "gist" scope.
           GIST_TOKEN:        ${{ secrets.GIST_TOKEN }}
+          GH_PAT:            ${{ secrets.GH_PAT }}
           GH_USERNAME:       ${{ secrets.GH_USERNAME }}
         run: |
           if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
