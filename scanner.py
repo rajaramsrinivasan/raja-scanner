@@ -501,6 +501,9 @@ def analyse_symbol(sym, data):
         return None
 
 
+SCANNED_COUNT = 0
+
+
 def run_full_scan(symbols):
     """Scan all symbols in batches and collect results."""
     results   = []
@@ -534,6 +537,8 @@ def run_full_scan(symbols):
     print(f"   Stocks scanned: {total - len(failed)}")
     print(f"   Signals found:  {len(results)}")
     print(f"   Failed:         {len(failed)}")
+    global SCANNED_COUNT
+    SCANNED_COUNT = total - len(failed)
 
     # Score first, then the projected 15-day return as the tie-breaker.
     return sorted(results, key=lambda x: (x["score"], x["pct_15"]), reverse=True)
@@ -719,7 +724,7 @@ def save_results(results):
         "watch":         [r for r in results if r["action"] == "WATCH"][:10],
         "top25":         [r for r in results if r["action"] == "BUY"][:TOP_N],
         "qualifying":    len([r for r in results if r["action"] == "BUY"]),
-        "total_scanned": len(results),
+        "total_scanned": SCANNED_COUNT or len(results),
     }
 
     with open(path, "w") as f:
@@ -735,6 +740,7 @@ def save_results(results):
     github_pat = os.environ.get("GIST_TOKEN", "") or os.environ.get("GH_PAT", "")
     if not github_pat:
         print("No GIST_TOKEN set — skipping Gist push. The dashboard will show a stale scan.")
+    pushed = False
     if gist_id and github_pat:
         try:
             resp = requests.patch(
@@ -747,10 +753,14 @@ def save_results(results):
             if resp.status_code == 200:
                 raw = "https://gist.githubusercontent.com/" + os.environ.get("GH_USERNAME","rajaramsrinivasan") + "/" + gist_id + "/raw/raja_scan_latest.json"
                 print("Gist updated: " + raw)
+                pushed = True
             else:
                 print("Gist update failed: " + str(resp.status_code) + " " + resp.text[:200])
         except Exception as e:
             print("Gist push failed: " + str(e))
+    if not pushed:
+        print("ERROR: Gist was NOT updated - failing the run so GitHub emails an alert.")
+        sys.exit(1)
     return path
 
 
